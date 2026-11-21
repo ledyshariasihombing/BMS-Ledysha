@@ -1,0 +1,115 @@
+#include <ESP32_CAN.h>
+ESP32_CAN<RX_SIZE_256, TX_SIZE_16> Can0;
+
+#define LED_RED   15   // tegangan di luar batas
+#define LED_GREEN  4   // salah satu NTC di atas batas suhu
+#define LED_YELLOW 2   // komunikasi CAN error
+
+#define TEGANGAN_MAX   3.0    
+#define TEGANGAN_MIN   0.5    
+#define SUHU_MAX       60.0   
+#define TIMEOUT_MS     1500   
+
+volatile float    tegangan = 0;
+volatile float    suhu[5]  = {0, 0, 0, 0, 0}; 
+volatile uint32_t time111 = 0;   
+volatile uint32_t time112 = 0;
+
+void onReceive(const CAN_message_t &msg)
+{
+  if (msg.id == 0x111 && msg.len == 8) 
+  {
+    tegangan = ((msg.buf[0] << 8) | msg.buf[1]) / 1000.0;
+    suhu[0]  = (int16_t)((msg.buf[2] << 8) | msg.buf[3]) / 100.0;
+    suhu[1]  = (int16_t)((msg.buf[4] << 8) | msg.buf[5]) / 100.0;
+    suhu[2]  = (int16_t)((msg.buf[6] << 8) | msg.buf[7]) / 100.0;
+    time111 = millis();
+  }
+  else if (msg.id == 0x112 && msg.len == 4)
+  {
+    suhu[3]  = (int16_t)((msg.buf[0] << 8) | msg.buf[1]) / 100.0;
+    suhu[4]  = (int16_t)((msg.buf[2] << 8) | msg.buf[3]) / 100.0;
+    time112 = millis();
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(LED_RED,  OUTPUT);
+  pinMode(LED_GREEN,  OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+
+  Can0.setRX(16);
+  Can0.setTX(17);
+  Can0.onReceive(onReceive);
+  Can0.begin();
+  Can0.setBaudRate(125000);
+  Serial.println("CAN READY!");
+}
+
+void loop()
+{
+  uint32_t now = millis();
+
+  // 1. Komunikasi error kalau salah satu frame belum pernah masuk atau sudah lama tidak masuk
+  bool ok111 = (time111 != 0) && (now - time111 < TIMEOUT_MS);
+  bool ok112 = (time112 != 0) && (now - time112 < TIMEOUT_MS);
+  bool errorKomunikasi = !(ok111 && ok112);
+
+  // 2. Tegangan error kalau di luar batas (dicek asal frame 0x111 pernah masuk)
+  bool errorTegangan = (time111 != 0) && ((tegangan > TEGANGAN_MAX) || (tegangan < TEGANGAN_MIN));
+
+  // 3. Suhu error kalau SALAH SATU NTC melewati batas
+  // NTC1-3 dicek dari frame 0x111, NTC4-5 dari frame 0x112
+  bool errorSuhu = false;
+
+  for (int i = 0; i < 5; i++)
+  {
+    bool adaData = (i < 3) ? (time111 != 0) : (time112 != 0);
+
+    if (adaData && suhu[i] > SUHU_MAX)
+    {
+      errorSuhu = true;
+    }
+  }
+
+  // 4. LED nyala kalau ada error
+  digitalWrite(LED_RED, errorTegangan ? HIGH : LOW);
+  digitalWrite(LED_GREEN, errorSuhu ? HIGH : LOW);
+  digitalWrite(LED_YELLOW, errorKomunikasi ? HIGH : LOW);
+
+  // 5. Tampilkan ke Serial Monitor tiap 1 detik
+  static uint32_t waktuCetak = 0;
+
+  if (now - waktuCetak >= 1000)
+  {
+    waktuCetak = now;
+
+    Serial.println("\n====== STATUS ======");
+
+    Serial.print("Komunikasi : ");
+    Serial.println(errorKomunikasi ? "ERROR (LED YELLOW)" : "OK");
+
+    Serial.print("Tegangan   : ");
+    Serial.print(tegangan);
+    Serial.println(errorTegangan ? " V -> ERROR (LED RED)" : " V");
+
+    for (int i = 0; i < 5; i++)
+    {
+      Serial.print("NTC ");
+      Serial.print(i + 1);
+      Serial.print("      : ");
+      Serial.print(suhu[i]);
+      Serial.println(" C");
+    }
+
+    if (errorSuhu)
+    {
+      Serial.println("Suhu       : FAULT, ada NTC di atas 60 C (LED GREEN)");
+    }
+  }
+
+  delay(10);
+}

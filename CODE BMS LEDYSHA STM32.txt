@@ -1,0 +1,578 @@
+/* USER CODE BEGIN Header */
+
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body (VERSI LENGKAP: tegangan + 5 NTC)
+  ******************************************************************************
+  */
+
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+#include <math.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+#define NTC_INVALID_C   (-99.0f)   /* nilai pengganti kalau sensor putus / korslet */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
+CAN_HandleTypeDef hcan;
+
+/* USER CODE BEGIN PV */
+
+volatile uint32_t adc_value_voltage = 0;
+volatile float voltage = 0.0f;
+
+volatile uint32_t adc_value_ntc1 = 0;
+volatile float voltage_ntc1 = 0.0f;
+volatile float resistance_ntc1 = 0.0f;
+volatile float temperatureK_ntc1 = 0.0f;
+volatile float temperatureC_ntc1 = 0.0f;
+
+volatile uint32_t adc_value_ntc2 = 0;
+volatile float voltage_ntc2 = 0.0f;
+volatile float resistance_ntc2 = 0.0f;
+volatile float temperatureK_ntc2 = 0.0f;
+volatile float temperatureC_ntc2 = 0.0f;
+
+volatile uint32_t adc_value_ntc3 = 0;
+volatile float voltage_ntc3 = 0.0f;
+volatile float resistance_ntc3 = 0.0f;
+volatile float temperatureK_ntc3 = 0.0f;
+volatile float temperatureC_ntc3 = 0.0f;
+
+volatile uint32_t adc_value_ntc4 = 0;
+volatile float voltage_ntc4 = 0.0f;
+volatile float resistance_ntc4 = 0.0f;
+volatile float temperatureK_ntc4 = 0.0f;
+volatile float temperatureC_ntc4 = 0.0f;
+
+volatile uint32_t adc_value_ntc5 = 0;
+volatile float voltage_ntc5 = 0.0f;
+volatile float resistance_ntc5 = 0.0f;
+volatile float temperatureK_ntc5 = 0.0f;
+volatile float temperatureC_ntc5 = 0.0f;
+
+ADC_ChannelConfTypeDef adcCfg = {0};
+
+CAN_FilterTypeDef canFilter;
+CAN_TxHeaderTypeDef txHeader;
+uint32_t txMailbox;
+uint16_t voltage_mV;
+int16_t temp1, temp2, temp3, temp4, temp5;
+uint16_t ntc1_data, ntc2_data, ntc3_data;
+uint16_t ntc4_data, ntc5_data;
+uint8_t canData1[8];   /* 0x111: tegangan + NTC1..3 */
+uint8_t canData2[4];   /* 0x112: NTC4..5 */
+
+/* ===================== STATUS KIRIM CAN =====================
+ * Tambahkan variabel can_* ini ke "Live Expressions".
+ *
+ * can_status:
+ *   0 = belum ada pengiriman
+ *   1 = SEMUA TERKIRIM (frame 0x111 dan 0x112 ter-ACK oleh node lain)
+ *   2 = TIDAK TERKIRIM / tidak ada ACK (frame menggantung, dibatalkan)
+ *   3 = GAGAL masuk mailbox (HAL_CAN_AddTxMessage error)
+ */
+volatile uint8_t  can_status        = 0;
+volatile uint8_t  can_frame111_sent = 0;
+volatile uint8_t  can_frame112_sent = 0;
+volatile uint32_t can_cnt_111       = 0;   /* total frame 0x111 terkirim */
+volatile uint32_t can_cnt_112       = 0;   /* total frame 0x112 terkirim */
+volatile uint32_t can_cnt_sent_ok   = 0;   /* siklus sukses (kedua frame) */
+volatile uint32_t can_cnt_noack     = 0;   /* siklus tanpa ACK */
+volatile uint32_t can_cnt_fail      = 0;   /* siklus gagal masuk mailbox */
+volatile uint32_t can_loop_count    = 0;   /* harus naik terus (kalau berhenti = hang) */
+volatile uint32_t can_hal_error     = 0;   /* kode error HAL_CAN_GetError() */
+volatile uint8_t  can_tec           = 0;   /* Transmit Error Counter */
+volatile uint8_t  can_rec           = 0;   /* Receive Error Counter */
+volatile uint8_t  can_lec           = 0;   /* 0 none,1 stuff,2 form,3 ACK,4 bit1,5 bit0,6 CRC */
+volatile uint8_t  can_busoff        = 0;   /* 1 = sedang bus-off */
+volatile uint32_t can_busoff_count  = 0;
+volatile uint32_t can_pclk1         = 0;
+volatile uint32_t can_baud_calc     = 0;   /* HARUS sama dengan ESP32 (125000) */
+/* ============================================================= */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_CAN_Init(void);
+/* USER CODE BEGIN PFP */
+
+static uint8_t  CAN_WaitTxDone(uint32_t mailbox);
+static void     CAN_ReadStatus(void);
+static uint32_t ADC_ReadChannel(uint32_t channel);
+static void     ReadNTC(uint32_t channel,
+                        volatile uint32_t *adc, volatile float *v,
+                        volatile float *r, volatile float *k, volatile float *c);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* Tunggu maks 20 ms sampai frame keluar dari mailbox.
+ * Return 1 = terkirim (ada yang ACK), 0 = tidak ada ACK (frame dibatalkan). */
+static uint8_t CAN_WaitTxDone(uint32_t mailbox)
+{
+  uint32_t t0 = HAL_GetTick();
+
+  while (HAL_CAN_IsTxMessagePending(&hcan, mailbox))
+  {
+    if ((HAL_GetTick() - t0) >= 20U)
+    {
+      HAL_CAN_AbortTxRequest(&hcan, mailbox);
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* Baca error counter dan pulihkan bus-off (AutoBusOff = DISABLE) */
+static void CAN_ReadStatus(void)
+{
+  uint32_t esr = hcan.Instance->ESR;
+
+  can_tec    = (uint8_t)((esr >> 16) & 0xFF);
+  can_rec    = (uint8_t)((esr >> 24) & 0xFF);
+  can_lec    = (uint8_t)((esr >> 4) & 0x07);
+  can_busoff = (uint8_t)((esr >> 2) & 0x01);
+
+  if (can_busoff)
+  {
+    HAL_CAN_Stop(&hcan);
+    HAL_CAN_Start(&hcan);
+    can_busoff_count++;
+  }
+}
+
+/* Baca 1 channel ADC (polling) */
+static uint32_t ADC_ReadChannel(uint32_t channel)
+{
+  uint32_t val;
+
+  adcCfg.Channel      = channel;
+  adcCfg.Rank         = ADC_REGULAR_RANK_1;
+  adcCfg.SamplingTime = ADC_SAMPLETIME_55CYCLES_5;
+
+  HAL_ADC_ConfigChannel(&hadc1, &adcCfg);
+  HAL_ADC_Start(&hadc1);
+  HAL_ADC_PollForConversion(&hadc1, 100);
+  val = HAL_ADC_GetValue(&hadc1);
+  HAL_ADC_Stop(&hadc1);
+
+  return val;
+}
+
+/* Baca 1 NTC 10k (B=3950) dan hitung suhu.
+ * Kalau ADC mendekati 0 atau 4095 (sensor putus/korslet) suhu diset NTC_INVALID_C
+ * supaya tidak jadi NaN/inf. */
+static void ReadNTC(uint32_t channel,
+                    volatile uint32_t *adc, volatile float *v,
+                    volatile float *r, volatile float *k, volatile float *c)
+{
+  *adc = ADC_ReadChannel(channel);
+  *v   = ((float)(*adc) * 3.3f) / 4095.0f;
+
+  if (*adc < 5U || *adc > 4090U)
+  {
+    *r = 0.0f;
+    *k = NTC_INVALID_C + 273.15f;
+    *c = NTC_INVALID_C;
+    return;
+  }
+
+  *r = (10000.0f * (*v)) / (3.3f - (*v));
+  *k = 1.0f / ((1.0f / 298.15f) + ((1.0f / 3950.0f) * logf((*r) / 10000.0f)));
+  *c = (*k) - 273.15f;
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_ADC1_Init();
+  MX_CAN_Init();
+  /* USER CODE BEGIN 2 */
+
+  canFilter.FilterBank = 0;
+  canFilter.FilterMode = CAN_FILTERMODE_IDMASK;
+  canFilter.FilterScale = CAN_FILTERSCALE_32BIT;
+
+  canFilter.FilterIdHigh = 0x0000;
+  canFilter.FilterIdLow = 0x0000;
+
+  canFilter.FilterMaskIdHigh = 0x0000;
+  canFilter.FilterMaskIdLow = 0x0000;
+
+  canFilter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+  canFilter.FilterActivation = ENABLE;
+
+  if (HAL_CAN_ConfigFilter(&hcan, &canFilter) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  txHeader.IDE = CAN_ID_STD;
+  txHeader.RTR = CAN_RTR_DATA;
+  txHeader.TransmitGlobalTime = DISABLE;
+
+  if (HAL_CAN_Start(&hcan) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* Baud = PCLK1 / Prescaler / (1 + BS1 + BS2) = PCLK1 / Prescaler / (1 + 5 + 2) */
+  can_pclk1     = HAL_RCC_GetPCLK1Freq();
+  can_baud_calc = can_pclk1 / (hcan.Init.Prescaler * 8U);
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+
+  while (1)
+  {
+    /* ---- Baca semua sensor ---- */
+    adc_value_voltage = ADC_ReadChannel(ADC_CHANNEL_6);
+    voltage = ((float)adc_value_voltage * 3.3f) / 4095.0f;
+    HAL_Delay(100);
+
+    ReadNTC(ADC_CHANNEL_0, &adc_value_ntc1, &voltage_ntc1, &resistance_ntc1, &temperatureK_ntc1, &temperatureC_ntc1);
+    HAL_Delay(100);
+
+    ReadNTC(ADC_CHANNEL_1, &adc_value_ntc2, &voltage_ntc2, &resistance_ntc2, &temperatureK_ntc2, &temperatureC_ntc2);
+    HAL_Delay(100);
+
+    ReadNTC(ADC_CHANNEL_2, &adc_value_ntc3, &voltage_ntc3, &resistance_ntc3, &temperatureK_ntc3, &temperatureC_ntc3);
+    HAL_Delay(100);
+
+    ReadNTC(ADC_CHANNEL_3, &adc_value_ntc4, &voltage_ntc4, &resistance_ntc4, &temperatureK_ntc4, &temperatureC_ntc4);
+    HAL_Delay(100);
+
+    ReadNTC(ADC_CHANNEL_4, &adc_value_ntc5, &voltage_ntc5, &resistance_ntc5, &temperatureK_ntc5, &temperatureC_ntc5);
+    HAL_Delay(100);
+
+    /* ---- Susun data CAN ---- */
+    voltage_mV = (uint16_t)(voltage * 1000.0f);
+    temp1 = (int16_t)(temperatureC_ntc1 * 100.0f);
+    temp2 = (int16_t)(temperatureC_ntc2 * 100.0f);
+    temp3 = (int16_t)(temperatureC_ntc3 * 100.0f);
+    temp4 = (int16_t)(temperatureC_ntc4 * 100.0f);
+    temp5 = (int16_t)(temperatureC_ntc5 * 100.0f);
+    ntc1_data = (uint16_t)temp1;
+    ntc2_data = (uint16_t)temp2;
+    ntc3_data = (uint16_t)temp3;
+    ntc4_data = (uint16_t)temp4;
+    ntc5_data = (uint16_t)temp5;
+
+    canData1[0] = voltage_mV >> 8;
+    canData1[1] = voltage_mV & 0xFF;
+    canData1[2] = ntc1_data >> 8;
+    canData1[3] = ntc1_data & 0xFF;
+    canData1[4] = ntc2_data >> 8;
+    canData1[5] = ntc2_data & 0xFF;
+    canData1[6] = ntc3_data >> 8;
+    canData1[7] = ntc3_data & 0xFF;
+
+    canData2[0] = ntc4_data >> 8;
+    canData2[1] = ntc4_data & 0xFF;
+    canData2[2] = ntc5_data >> 8;
+    canData2[3] = ntc5_data & 0xFF;
+
+    /* ---- Kirim frame ---- */
+    uint8_t tx_fail = 0;
+    can_frame111_sent = 0;
+    can_frame112_sent = 0;
+
+    txHeader.StdId = 0x111;
+    txHeader.DLC = 8;
+
+    if (HAL_CAN_AddTxMessage(&hcan, &txHeader, canData1, &txMailbox) != HAL_OK)
+    {
+      tx_fail = 1;
+      can_hal_error = HAL_CAN_GetError(&hcan);
+      HAL_CAN_AbortTxRequest(&hcan, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
+    }
+    else
+    {
+      can_frame111_sent = CAN_WaitTxDone(txMailbox);
+      if (can_frame111_sent) can_cnt_111++;
+    }
+
+    txHeader.StdId = 0x112;
+    txHeader.DLC = 4;
+
+    if (HAL_CAN_AddTxMessage(&hcan, &txHeader, canData2, &txMailbox) != HAL_OK)
+    {
+      tx_fail = 1;
+      can_hal_error = HAL_CAN_GetError(&hcan);
+      HAL_CAN_AbortTxRequest(&hcan, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
+    }
+    else
+    {
+      can_frame112_sent = CAN_WaitTxDone(txMailbox);
+      if (can_frame112_sent) can_cnt_112++;
+    }
+
+    /* ---- Status akhir siklus ---- */
+    if (tx_fail)
+    {
+      can_status = 3;
+      can_cnt_fail++;
+    }
+    else if (can_frame111_sent && can_frame112_sent)
+    {
+      can_status = 1;
+      can_cnt_sent_ok++;
+    }
+    else
+    {
+      can_status = 2;
+      can_cnt_noack++;
+    }
+
+    CAN_ReadStatus();
+    can_loop_count++;
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+
+  }
+
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV2;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_6;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_55CYCLES_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief CAN Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN_Init(void)
+{
+
+  /* USER CODE BEGIN CAN_Init 0 */
+
+  /* USER CODE END CAN_Init 0 */
+
+  /* USER CODE BEGIN CAN_Init 1 */
+
+  /* USER CODE END CAN_Init 1 */
+  hcan.Instance = CAN1;
+  hcan.Init.Prescaler = 2;
+  hcan.Init.Mode = CAN_MODE_NORMAL;
+  hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan.Init.TimeSeg1 = CAN_BS1_5TQ;
+  hcan.Init.TimeSeg2 = CAN_BS2_2TQ;
+  hcan.Init.TimeTriggeredMode = DISABLE;
+  hcan.Init.AutoBusOff = DISABLE;
+  hcan.Init.AutoWakeUp = DISABLE;
+  hcan.Init.AutoRetransmission = ENABLE;
+  hcan.Init.ReceiveFifoLocked = DISABLE;
+  hcan.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN_Init 2 */
+
+  /* USER CODE END CAN_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
